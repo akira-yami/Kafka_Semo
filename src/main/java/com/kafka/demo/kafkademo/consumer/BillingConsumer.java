@@ -21,7 +21,7 @@ public class BillingConsumer {
     @KafkaListener(
             topics = KafkaConfig.TOPIC_ORDER_EVENTS,
             groupId = "billing-group",
-            containerFactory = "kafkaListenerContainerFactory"
+            containerFactory = "billingKafkaListenerContainerFactory"
     )
     public void onOrderCreated(
             @Payload OrderCreatedEvent event,
@@ -39,23 +39,8 @@ public class BillingConsumer {
             throw new IllegalArgumentException("Invalid negative payment amount: " + event.amount());
         }
 
-        // BƯỚC 1: XỬ LÝ NGHIỆP VỤ & LƯU VÀO DATABASE
-        processPayment(event);
-
-        // BƯỚC 2: CHỈ GỌI MANUAL ACK KHI NGHIỆP VỤ ĐÃ THÀNH CÔNG HOÀN TOÀN
-        if (ack != null) {
-            ack.acknowledge();
-            log.info("[BillingConsumer SUCCESS] Đã trừ tiền thành công cho Order=[{}]. Gọi ack.acknowledge() để commit Offset=[{}].",
-                    event.orderId(), offset);
-        }
-    }
-
-    private void processPayment(OrderCreatedEvent event) {
-        try {
-            // Giả lập thời gian xử lý giao dịch thanh toán ngân hàng
-            Thread.sleep(100);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        ack.acknowledge();
+        log.info("[BillingConsumer SUCCESS] Mô phỏng thanh toán Order=[{}], đã gọi ack.acknowledge() cho Partition=[{}], Offset=[{}].",
+                event.orderId(), partition, offset);
     }
 }

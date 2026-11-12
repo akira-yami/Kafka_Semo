@@ -1,17 +1,27 @@
 package com.kafka.demo.kafkademo.config;
 
+import com.kafka.demo.kafkademo.model.OrderCreatedEvent;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.springframework.boot.kafka.autoconfigure.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.boot.kafka.autoconfigure.KafkaProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.support.serializer.DelegatingByTypeSerializer;
+import org.springframework.kafka.support.serializer.JsonSerializer;
 import org.springframework.util.backoff.FixedBackOff;
+
+import java.util.Map;
 
 @Configuration
 public class KafkaConfig {
@@ -41,6 +51,16 @@ public class KafkaConfig {
                 .build();
     }
 
+    @Bean
+    public ProducerFactory<Object, Object> kafkaProducerFactory(KafkaProperties properties) {
+        return new DefaultKafkaProducerFactory<>(properties.buildProducerProperties(),
+                null,
+                () -> new DelegatingByTypeSerializer(Map.of(
+                        OrderCreatedEvent.class, new JsonSerializer<OrderCreatedEvent>(),
+                        byte[].class, new ByteArraySerializer()
+                )));
+    }
+
     /**
      * Cấu hình Error Handler:
      * 1. Thử lại tối đa 3 lần (1 lần gốc + 2 lần retry), cách nhau 1000ms.
@@ -53,25 +73,24 @@ public class KafkaConfig {
                 (record, ex) -> new TopicPartition(TOPIC_ORDER_EVENTS_DLT, 0)
         );
 
-        // Thử lại 2 lần (khoảng cách 1000ms), tổng cộng 3 lần xử lý
-        FixedBackOff fixedBackOff = new FixedBackOff(1000L, 2L);
-        return new DefaultErrorHandler(recoverer, fixedBackOff);
+        recoverer.setFailIfSendResultIsError(true);
+        DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 2L));
+        handler.setCommitRecovered(true);
+        return handler;
     }
 
     /**
      * Cấu hình Container Factory với Manual Acknowledgment.
      */
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, Object> kafkaListenerContainerFactory(
-            ConsumerFactory<String, Object> consumerFactory,
-            DefaultErrorHandler defaultErrorHandler
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> billingKafkaListenerContainerFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory
     ) {
-        ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory);
+        configurer.configure(factory, consumerFactory);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-        factory.setCommonErrorHandler(defaultErrorHandler);
-        factory.setConcurrency(3); // 3 worker threads tương ứng 3 partitions
         return factory;
     }
 }

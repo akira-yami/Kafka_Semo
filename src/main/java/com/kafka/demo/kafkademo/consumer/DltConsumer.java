@@ -6,9 +6,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.KafkaHeaders;
-import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Service;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 @Service
@@ -18,22 +18,25 @@ public class DltConsumer {
 
     @KafkaListener(
             topics = KafkaConfig.TOPIC_ORDER_EVENTS_DLT,
-            groupId = "dlt-monitor-group"
+            groupId = "dlt-monitor-group",
+            concurrency = "1",
+            properties = "value.deserializer=org.apache.kafka.common.serialization.ByteArrayDeserializer"
     )
-    public void onDltMessage(
-            ConsumerRecord<String, Object> record,
-            @Header(value = KafkaHeaders.DLT_ORIGINAL_TOPIC, required = false) byte[] origTopic,
-            @Header(value = KafkaHeaders.DLT_ORIGINAL_OFFSET, required = false) byte[] origOffset,
-            @Header(value = KafkaHeaders.DLT_EXCEPTION_MESSAGE, required = false) byte[] exceptionMsg
-    ) {
-        String reason = exceptionMsg != null ? new String(exceptionMsg, StandardCharsets.UTF_8) : "Unknown";
-        String topic = origTopic != null ? new String(origTopic, StandardCharsets.UTF_8) : "N/A";
+    public void onDltMessage(ConsumerRecord<String, byte[]> record) {
+        var originalPartition = record.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_PARTITION);
+        var originalOffset = record.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_OFFSET);
+        log.warn("[DLT] key={} sourceGroup={} sourceTopic={} sourcePartition={} sourceOffset={} dltPartition={} dltOffset={} reason={}",
+                record.key(), textHeader(record, KafkaHeaders.DLT_ORIGINAL_CONSUMER_GROUP),
+                textHeader(record, KafkaHeaders.DLT_ORIGINAL_TOPIC),
+                originalPartition != null && originalPartition.value() != null && originalPartition.value().length == Integer.BYTES
+                        ? ByteBuffer.wrap(originalPartition.value()).getInt() : null,
+                originalOffset != null && originalOffset.value() != null && originalOffset.value().length == Long.BYTES
+                        ? ByteBuffer.wrap(originalOffset.value()).getLong() : null,
+                record.partition(), record.offset(), textHeader(record, KafkaHeaders.DLT_EXCEPTION_MESSAGE));
+    }
 
-        log.warn("================================================================================");
-        log.warn("[DEAD LETTER TOPIC MONITOR] PHÁT HIỆN TIN NHẮN BỊ CÔ LẬP TRONG DLT!");
-        log.warn("Key: {}, Value: {}", record.key(), record.value());
-        log.warn("Original Topic: {}, Partition: {}, Offset trong DLT: {}", topic, record.partition(), record.offset());
-        log.warn("Lý do thất bại (Exception Message): {}", reason);
-        log.warn("================================================================================");
+    private String textHeader(ConsumerRecord<String, byte[]> record, String name) {
+        var header = record.headers().lastHeader(name);
+        return header == null || header.value() == null ? null : new String(header.value(), StandardCharsets.UTF_8);
     }
 }

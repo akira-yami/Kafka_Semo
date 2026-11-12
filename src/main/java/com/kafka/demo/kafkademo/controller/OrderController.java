@@ -2,11 +2,20 @@ package com.kafka.demo.kafkademo.controller;
 
 import com.kafka.demo.kafkademo.model.OrderCreatedEvent;
 import com.kafka.demo.kafkademo.producer.OrderProducer;
+import com.kafka.demo.kafkademo.producer.OrderProducer.PublishedOrder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.kafka.KafkaException;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -14,6 +23,7 @@ import java.util.UUID;
 @RequestMapping("/api/orders")
 public class OrderController {
 
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
     private final OrderProducer orderProducer;
 
     public OrderController(OrderProducer orderProducer) {
@@ -28,7 +38,11 @@ public class OrderController {
             @RequestParam(required = false) String orderId,
             @RequestParam(defaultValue = "500000") BigDecimal amount
     ) {
-        String finalOrderId = orderId != null ? orderId : "ORD-" + UUID.randomUUID().toString().substring(0, 8);
+        if (amount.signum() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "amount must be non-negative");
+        }
+        String finalOrderId = orderId != null ? orderId : "ORD-" + UUID.randomUUID();
+        validateKey(finalOrderId);
         OrderCreatedEvent event = new OrderCreatedEvent(
                 finalOrderId,
                 "CUST-" + (int)(Math.random() * 1000),
@@ -38,11 +52,7 @@ public class OrderController {
                 Instant.now()
         );
 
-        orderProducer.publishOrder(event);
-
-        return ResponseEntity.ok(Map.of(
-                "status", "PUBLISHED",
-                "message", "Order event sent to Kafka asynchronously",
+        return publish(List.of(event), "PUBLISHED", Map.of(
                 "orderId", finalOrderId,
                 "amount", amount
         ));
@@ -55,23 +65,12 @@ public class OrderController {
     public ResponseEntity<Map<String, Object>> createSameKeyOrders(
             @RequestParam(defaultValue = "ORD-888") String key
     ) {
-        for (String status : new String[]{"CREATED", "PAID", "DELIVERED"}) {
-            OrderCreatedEvent event = new OrderCreatedEvent(
-                    key,
-                    "CUST-VIP-01",
-                    BigDecimal.valueOf(1200000),
-                    "VND",
-                    status,
-                    Instant.now()
-            );
-            orderProducer.publishOrder(event);
-        }
-
-        return ResponseEntity.ok(Map.of(
-                "status", "PUBLISHED_3_EVENTS",
-                "key", key,
-                "note", "Kiểm tra Kafka UI/Console: Cả 3 event luôn rơi vào cùng 1 Partition!"
-        ));
+        validateKey(key);
+        List<OrderCreatedEvent> events = List.of("CREATED", "PAID", "DELIVERED").stream()
+                .map(status -> new OrderCreatedEvent(key, "CUST-VIP-01", BigDecimal.valueOf(1200000),
+                        "VND", status, Instant.now()))
+                .toList();
+        return publish(events, "PUBLISHED_3_EVENTS", Map.of("key", key));
     }
 
     /**
@@ -79,7 +78,7 @@ public class OrderController {
      */
     @PostMapping("/error")
     public ResponseEntity<Map<String, Object>> createErrorOrder() {
-        String errorOrderId = "ERR-" + UUID.randomUUID().toString().substring(0, 6);
+        String errorOrderId = "ERR-" + UUID.randomUUID();
         OrderCreatedEvent event = new OrderCreatedEvent(
                 errorOrderId,
                 "CUST-TEST",
@@ -89,36 +88,61 @@ public class OrderController {
                 Instant.now()
         );
 
-        orderProducer.publishOrder(event);
-
-        return ResponseEntity.ok(Map.of(
-                "status", "PUBLISHED_ERROR_ORDER",
+        return publish(List.of(event), "PUBLISHED_ERROR_ORDER", Map.of(
                 "orderId", errorOrderId,
-                "note", "BillingConsumer sẽ retry 3 lần rồi chuyển sang topic order-events-dlt!"
+                "note", "Billing thử xử lý tối đa 3 lần, sau đó chuyển sang order-events-dlt."
         ));
     }
 
     /**
-     * 4. Kịch bản Stress: Bắn 10 đơn hàng song song để xem chia tải qua 3 Partition.
+     * 4. Gửi 10 key cố định để dễ quan sát cách Kafka chia tải qua các partition.
      */
     @PostMapping("/batch")
     public ResponseEntity<Map<String, Object>> createBatchOrders() {
+        List<OrderCreatedEvent> events = new ArrayList<>();
         for (int i = 1; i <= 10; i++) {
             String orderId = "BATCH-" + i;
-            OrderCreatedEvent event = new OrderCreatedEvent(
+            events.add(new OrderCreatedEvent(
                     orderId,
                     "CUST-" + i,
                     BigDecimal.valueOf(100000 + i * 10000),
                     "VND",
                     "CREATED",
                     Instant.now()
-            );
-            orderProducer.publishOrder(event);
+            ));
         }
 
-        return ResponseEntity.ok(Map.of(
-                "status", "BATCH_PUBLISHED_10",
-                "note", "10 đơn hàng đã được phân bổ đều ra 3 Partition."
-        ));
+        return publish(events, "BATCH_PUBLISHED_10", Map.of());
+    }
+
+    private ResponseEntity<Map<String, Object>> publish(
+            List<OrderCreatedEvent> events, String successStatus, Map<String, Object> details
+    ) {
+        List<PublishedOrder> records = new ArrayList<>();
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.putAll(details);
+        response.put("requestedCount", events.size());
+        response.put("records", records);
+
+        for (OrderCreatedEvent event : events) {
+            try {
+                records.add(orderProducer.publishOrder(event));
+            } catch (KafkaException | org.apache.kafka.common.KafkaException ex) {
+                log.warn("Kafka did not confirm key={} status={} after {} confirmed record(s)",
+                        event.orderId(), event.status(), records.size(), ex);
+                response.put("status", records.isEmpty() ? "PUBLISH_UNCONFIRMED" : "PARTIALLY_PUBLISHED");
+                response.put("unconfirmedRecord", Map.of("orderId", event.orderId(), "eventStatus", event.status()));
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(response);
+            }
+        }
+
+        response.put("status", successStatus);
+        return ResponseEntity.ok(response);
+    }
+
+    private void validateKey(String key) {
+        if (key.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Order key must not be blank");
+        }
     }
 }
