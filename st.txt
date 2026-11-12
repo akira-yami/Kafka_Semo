@@ -1,0 +1,2 @@
+kafka-ui | Up 4 minutes
+kafka-broker | Up 4 minutes
