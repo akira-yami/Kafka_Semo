@@ -44,6 +44,17 @@ import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+/**
+ * ============================================================================
+ * TEST SUITE: KafkaDemoApplicationTests
+ * VAI TRÒ: Kiểm thử tích hợp toàn diện (Integration Tests) cho hệ thống Kafka Demo.
+ * 
+ * ĐẶC ĐIỂM:
+ * - Sử dụng @EmbeddedKafka để tạo cụm Kafka Broker giả lập ngay trong bộ nhớ (In-memory),
+ *   giúp chạy kiểm thử tự động độc lập mà KHÔNG cần Docker ngoài.
+ * - Kiểm tra tất cả 4 kịch bản: Normal, Same-Key, Batch, và Error Retry/DLT.
+ * ============================================================================
+ */
 @SpringBootTest
 @AutoConfigureMockMvc
 @EmbeddedKafka(bootstrapServersProperty = "spring.kafka.bootstrap-servers",
@@ -64,13 +75,25 @@ class KafkaDemoApplicationTests {
     @Autowired
     private KafkaTemplate<Object, Object> template;
 
+    /**
+     * TEST CASE 1: Kiểm tra luồng đẩy tin, xử lý song song và khả năng phục hồi khi gặp bản ghi lỗi.
+     * Bao gồm:
+     * - Kiểm tra validate tham số (amount âm trả 400 Bad Request).
+     * - Kịch bản Normal: Fan-out đến cả 3 nhóm và commit offset thành công.
+     * - Kịch bản Same-Key: Cùng partition, giữ nguyên thứ tự offset tăng dần.
+     * - Kịch bản Batch: Phân bổ dữ liệu đều qua cả 3 partitions (0, 1, 2).
+     * - Kịch bản Poison Pill: Đơn hàng lỗi hoặc JSON sai định dạng được đẩy an toàn sang DLT.
+     */
     @Test
     void demoPublishesAndCommitsEvenWhenARecordIsInvalid() throws Exception {
         try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString()));
              var reader = new KafkaConsumer<>(Map.of(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString()),
                      new StringDeserializer(), new ByteArrayDeserializer())) {
+            
+            // 1. Kiểm tra validation phía client: Số tiền âm phải bị từ chối với HTTP 400
             mvc.perform(post("/api/orders").param("amount", "-1")).andExpect(status().isBadRequest());
 
+            // 2. Kiểm tra kịch bản Normal: Cả 3 consumer groups đều commit offset thành công
             JsonNode normal = publish("/api/orders").required("records").get(0);
             await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
                 for (String group : ORDER_GROUPS) {
@@ -78,6 +101,7 @@ class KafkaDemoApplicationTests {
                 }
             });
 
+            // 3. Kiểm tra kịch bản Same-Key: 3 sự kiện cùng key phải chung partition và offset tăng dần
             JsonNode sameKey = publish("/api/orders/same-key").required("records");
             assertThat(sameKey).hasSize(3);
             assertThat(sameKey).extracting(record -> record.required("eventStatus").asText())
@@ -87,16 +111,19 @@ class KafkaDemoApplicationTests {
             assertThat(sameKey).extracting(record -> record.required("offset").asLong())
                     .doesNotHaveDuplicates().isSorted();
 
+            // 4. Kiểm tra kịch bản Batch: 10 tin nhắn được phân bổ vào cả 3 partitions (0, 1, 2)
             JsonNode batch = publish("/api/orders/batch").required("records");
             assertThat(batch).hasSize(10);
             assertThat(batch).extracting(record -> record.required("partition").asInt())
                     .contains(0, 1, 2);
 
+            // 5. Kiểm tra kịch bản Poison Pill (Số tiền âm): Billing commit offset sau khi chuyển DLT
             JsonNode invalid = publish("/api/orders/error").required("records").get(0);
             await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
                     assertCommitted(admin, "billing-group", sourcePartition(invalid),
                             invalid.required("offset").asLong() + 1));
 
+            // 6. Kiểm tra Poison Pill dạng JSON hỏng: Ứng dụng không bị sập và bản ghi sau đó vẫn đọc được
             byte[] malformed = "malformed json".getBytes(StandardCharsets.UTF_8);
             var badRecord = template.send(TOPIC_ORDER_EVENTS, "after-poison", malformed)
                     .get(10, TimeUnit.SECONDS).getRecordMetadata();
@@ -111,6 +138,7 @@ class KafkaDemoApplicationTests {
                 assertCommitted(admin, "dlt-monitor-group", DLT_PARTITION, 4);
             });
 
+            // 7. Xác nhận các bản ghi lỗi đã nằm trong Dead Letter Topic kèm header chỉ định nhóm lỗi
             reader.assign(Set.of(DLT_PARTITION));
             reader.seekToBeginning(Set.of(DLT_PARTITION));
             var deadLetters = StreamSupport.stream(reader.poll(Duration.ofSeconds(5)).spliterator(), false).toList();
@@ -124,6 +152,11 @@ class KafkaDemoApplicationTests {
         }
     }
 
+    /**
+     * TEST CASE 2: Kiểm tra xử lý lỗi khi gửi tin nhắn bị đứt quãng giữa chừng.
+     * Khi Broker bị lỗi hoặc không xác nhận ở sự kiện thứ hai, API phải trả về HTTP 503
+     * và chỉ liệt kê các bản ghi đã được xác nhận thành công trước đó.
+     */
     @Test
     void reportsOnlyConfirmedRecordsWhenPublishingStopsMidRequest() {
         OrderProducer producer = mock(OrderProducer.class);
@@ -139,15 +172,18 @@ class KafkaDemoApplicationTests {
         verify(producer, times(2)).publishOrder(any());
     }
 
+    // Helper: Gửi HTTP POST và parse phản hồi JSON
     private JsonNode publish(String path) throws Exception {
         return json.readTree(mvc.perform(post(path)).andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsByteArray());
     }
 
+    // Helper: Trích xuất TopicPartition từ JsonNode kết quả
     private TopicPartition sourcePartition(JsonNode record) {
         return new TopicPartition(record.required("topic").asText(), record.required("partition").asInt());
     }
 
+    // Helper: Kiểm tra offset của Consumer Group đã được commit đạt mức kỳ vọng
     private void assertCommitted(Admin admin, String group, TopicPartition partition, long expected) throws Exception {
         var offset = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata()
                 .get(3, TimeUnit.SECONDS).get(partition);

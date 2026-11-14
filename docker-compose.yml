@@ -1,32 +1,49 @@
+# ==============================================================================
+# HẠ TẦNG DOCKER COMPOSE CHO DỰ ÁN KAFKA DEMO
+# Bao gồm 2 dịch vụ:
+# 1. kafka: Apache Kafka 3.7.0 chạy ở chế độ KRaft (không cần ZooKeeper).
+# 2. kafka-ui: Giao diện web trực quan để quản lý Topics, Messages, Consumers.
+# ==============================================================================
+
 services:
   kafka:
     image: apache/kafka:3.7.0
+    container_name: kafka-broker
     ports:
+      # Port 9092: Dành cho ứng dụng Spring Boot chạy trực tiếp trên máy host kết nối vào
       - "127.0.0.1:9092:9092"
     environment:
-      # Kafka KRaft Configuration
+      # --- CẤU HÌNH KAFKA KRAFT (Thay thế ZooKeeper) ---
       KAFKA_NODE_ID: 1
+      # Node này đóng đồng thời cả 2 vai trò: Broker (lưu trữ tin) và Controller (quản lý cụm)
       KAFKA_PROCESS_ROLES: broker,controller
-      # Tách riêng 2 listener:
-      # - PLAINTEXT (9092) cho ứng dụng Spring Boot chạy trên máy host (localhost:9092)
-      # - PLAINTEXT_INTERNAL (29092) cho Kafka UI chạy bên trong mạng Docker (kafka:29092)
-      # - CONTROLLER (9093) cho thuật toán KRaft
+
+      # --- CẤU HÌNH MẠNG & LISTENERS ---
+      # Tách riêng các listener theo mục đích:
+      # - PLAINTEXT (9092): Cho ứng dụng Spring Boot trên máy host (localhost:9092)
+      # - PLAINTEXT_INTERNAL (29092): Cho Kafka UI chạy trong mạng Docker (kafka:29092)
+      # - CONTROLLER (9093): Cho thuật toán đồng thuận Raft nội bộ
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+
+      # --- CẤU HÌNH REPLICATION & PARTITION MẶC ĐỊNH ---
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
+      # Tắt tính năng tự động tạo topic khi gửi tin chưa khai báo (để Spring Boot chủ động tạo)
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
+      # Lưu dữ liệu log và offset bền vững trên Docker volume
       - kafka-data:/var/lib/kafka/data
     healthcheck:
+      # Kiểm tra sức khỏe của broker định kỳ bằng lệnh liệt kê topics
       test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:29092", "--list"]
       interval: 5s
       timeout: 5s
@@ -37,14 +54,17 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818
+    container_name: kafka-ui
     ports:
+      # Truy cập giao diện quản trị tại: http://localhost:8080
       - "127.0.0.1:8080:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local-kraft-cluster
-      # Kết nối tới Kafka qua internal listener 29092
+      # Kết nối tới Kafka Broker thông qua mạng nội bộ Docker listener 29092
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
       kafka:
+        # Chỉ khởi động Kafka UI sau khi Kafka Broker đã vượt qua healthcheck thành công
         condition: service_healthy
     networks:
       - kafka-net
